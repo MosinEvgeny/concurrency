@@ -103,33 +103,14 @@ func normalizeAppEventToEvent(ctx context.Context, in <-chan AppEvent) chan Even
 	return out
 }
 
-func merge(ctx context.Context, first, second chan Event) chan Event {
+func merge(ctx context.Context, channels ...chan Event) chan Event {
 	out := make(chan Event)
 	wg := &sync.WaitGroup{}
 
-	send := func(c chan Event) {
-		defer wg.Done()
-
-		for {
-			select {
-			case v, ok := <-c:
-				if !ok {
-					return
-				}
-				select {
-				case out <- v:
-				case <-ctx.Done():
-					return
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
+	for _, c := range channels {
+		wg.Add(1)
+		go sendEvents(ctx, c, out, wg)
 	}
-
-	wg.Add(2)
-	go send(first)
-	go send(second)
 
 	go func() {
 		wg.Wait()
@@ -139,7 +120,26 @@ func merge(ctx context.Context, first, second chan Event) chan Event {
 	return out
 }
 
-// Доделать + во все методы добавить контекст
+func sendEvents(ctx context.Context, in <-chan Event, out chan<- Event, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	for {
+		select {
+		case v, ok := <-in:
+			if !ok {
+				return
+			}
+			select {
+			case out <- v:
+			case <-ctx.Done():
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 func batch(ctx context.Context, in chan Event, size uint64, timeout time.Duration) chan []Event {
 	out := make(chan []Event)
 
@@ -147,39 +147,25 @@ func batch(ctx context.Context, in chan Event, size uint64, timeout time.Duratio
 		defer close(out)
 
 		eventSlice := make([]Event, 0, size)
-		timer := time.NewTimer(timeout)
-		defer timer.Stop()
-
-		flush := func() {
-			if len(eventSlice) == 0 {
-				return
-			}
-
-			select {
-			case out <- eventSlice:
-			case <-ctx.Done():
-				return
-			}
-			eventSlice = make([]Event, 0, size)
-		}
+		ticker := time.NewTicker(timeout)
+		defer ticker.Stop()
 
 		for {
 			select {
 			case e, ok := <-in:
 				if !ok {
-					flush()
+					flushBatch(ctx, out, eventSlice, size)
 					return
 				}
 				eventSlice = append(eventSlice, e)
 				if uint64(len(eventSlice)) == size {
-					flush()
-					timer.Stop()
-					timer = time.NewTimer(timeout)
+					eventSlice = flushBatch(ctx, out, eventSlice, size)
+					ticker.Reset(timeout)
 				}
 
-			case <-timer.C:
-				flush()
-				timer = time.NewTimer(timeout)
+			case <-ticker.C:
+				eventSlice = flushBatch(ctx, out, eventSlice, size)
+				ticker.Reset(timeout)
 
 			case <-ctx.Done():
 				return
@@ -188,6 +174,20 @@ func batch(ctx context.Context, in chan Event, size uint64, timeout time.Duratio
 	}()
 
 	return out
+}
+
+func flushBatch(ctx context.Context, out chan<- []Event, buf []Event, size uint64) []Event {
+	if len(buf) == 0 {
+		return buf
+	}
+
+	select {
+	case out <- buf:
+	case <-ctx.Done():
+		return buf
+	}
+
+	return make([]Event, 0, size)
 }
 
 // --- Генераторы ---
