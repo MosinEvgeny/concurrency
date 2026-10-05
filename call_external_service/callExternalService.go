@@ -34,8 +34,9 @@ type Job struct {
 }
 
 type Result struct {
-	square int
-	error  error
+	square   int
+	error    error
+	panicked bool
 }
 
 func main() {
@@ -49,6 +50,10 @@ func main() {
 	ctx := context.Background()
 	wg := &sync.WaitGroup{}
 
+	statistics := Stats{
+		byWorker: make(map[int]int),
+	}
+
 	go func() {
 		for i := 1; i <= N; i++ {
 			jobs <- Job{
@@ -58,7 +63,7 @@ func main() {
 		close(jobs)
 	}()
 
-	for range M {
+	for workerID := range M {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -68,6 +73,13 @@ func main() {
 
 				res := processJob(subCtx, job)
 				cancel()
+				if res.panicked {
+					statistics.recordPanics()
+				} else if res.error != nil {
+					statistics.recordFailed()
+				} else {
+					statistics.recordSuccess(workerID)
+				}
 
 				results <- res
 			}
@@ -82,12 +94,15 @@ func main() {
 	for res := range results {
 		fmt.Printf("Результат: %d, ошибка: %v \n", res.square, res.error)
 	}
+
+	fmt.Printf("\nStatistics:\nPanics: %d\nFailed: %d\nBy worker: %v\n", statistics.panics, statistics.failed, statistics.byWorker)
 }
 
 func processJob(ctx context.Context, job Job) (res Result) {
 	defer func() {
 		if p := recover(); p != nil {
 			res.error = fmt.Errorf("job %d: panic: %v", job.ID, p)
+			res.panicked = true
 		}
 	}()
 	res.square, res.error = callExternalService(ctx, job)
@@ -112,4 +127,29 @@ func callExternalService(ctx context.Context, j Job) (int, error) {
 	default:
 		return j.ID * j.ID, nil
 	}
+}
+
+type Stats struct {
+	mu       sync.Mutex
+	panics   int
+	failed   int
+	byWorker map[int]int
+}
+
+func (s *Stats) recordSuccess(workerID int) {
+	s.mu.Lock()
+	s.byWorker[workerID]++
+	s.mu.Unlock()
+}
+
+func (s *Stats) recordPanics() {
+	s.mu.Lock()
+	s.panics++
+	s.mu.Unlock()
+}
+
+func (s *Stats) recordFailed() {
+	s.mu.Lock()
+	s.failed++
+	s.mu.Unlock()
 }
