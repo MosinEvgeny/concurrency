@@ -25,7 +25,10 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -39,92 +42,134 @@ type Result struct {
 	panicked bool
 }
 
+type Stats struct {
+	mu       sync.Mutex
+	panics   int
+	failed   int
+	byWorker map[int]int
+}
+
+func (s *Stats) record(workerID int, res Result) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	switch {
+	case res.panicked:
+		s.panics++
+	case res.error != nil:
+		s.failed++
+	default:
+		s.byWorker[workerID]++
+	}
+}
+
 func main() {
-	N := 10
-	M := 4
-	K := 2
-	timeout := time.Second * 3
+	jobCount := 10
+	workerCount := 4
+	maxConcurrent := 2
+	timeout := 3 * time.Second
+	shutdownTimeout := 2 * time.Second
+
+	workCtx, cancelWork := context.WithTimeout(context.Background(), timeout)
+	defer cancelWork()
+
+	stopCtx, stop := signal.NotifyContext(workCtx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	jobs := make(chan Job)
 	results := make(chan Result)
-	semaphore := make(chan struct{}, K)
+	semaphore := make(chan struct{}, maxConcurrent)
+	statistics := &Stats{byWorker: make(map[int]int)}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	wg := &sync.WaitGroup{}
-
-	statistics := Stats{
-		byWorker: make(map[int]int),
-	}
-
+	producerDone := make(chan struct{})
 	go func() {
-		defer close(jobs)
-		for i := 1; i <= N; i++ {
-			select {
-			case <-ctx.Done():
-				return
-			case jobs <- Job{ID: i}:
-			}
-		}
+		defer close(producerDone)
+		produceJobs(stopCtx, jobCount, jobs)
 	}()
 
-	for workerID := range M {
-		wg.Add(1)
+	var workers sync.WaitGroup
+	for workerID := range workerCount {
+		workers.Add(1)
 		go func() {
-			defer wg.Done()
-
-			for {
-				select {
-				case job, ok := <-jobs:
-					if !ok {
-						return
-					}
-					select {
-					case <-ctx.Done():
-						return
-					case semaphore <- struct{}{}:
-					}
-
-					if ctx.Err() != nil {
-						<-semaphore
-						return
-					}
-
-					res := processJob(ctx, job)
-					<-semaphore
-
-					if res.panicked {
-						statistics.recordPanics()
-					} else if res.error != nil {
-						statistics.recordFailed()
-					} else {
-						statistics.recordSuccess(workerID)
-					}
-
-					select {
-					case <-ctx.Done():
-						return
-					case results <- res:
-					}
-
-				case <-ctx.Done():
-					return
-				}
-			}
+			defer workers.Done()
+			runWorker(workCtx, stopCtx, workerID, jobs, results, semaphore, statistics)
 		}()
 	}
 
+	workersDone := make(chan struct{})
 	go func() {
-		wg.Wait()
+		workers.Wait()
 		close(results)
+		close(workersDone)
+	}()
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		waitForShutdown(workCtx, stopCtx, workersDone, shutdownTimeout, cancelWork)
 	}()
 
 	for res := range results {
-		fmt.Printf("Результат: %d, ошибка: %v \n", res.square, res.error)
+		fmt.Printf("Результат: %d, ошибка: %v\n", res.square, res.error)
 	}
+	<-producerDone
+	<-shutdownDone
 
 	fmt.Printf("\nStatistics:\nPanics: %d\nFailed: %d\nBy worker: %v\n", statistics.panics, statistics.failed, statistics.byWorker)
+}
+
+func produceJobs(ctx context.Context, count int, jobs chan<- Job) {
+	defer close(jobs)
+	for id := 1; id <= count; id++ {
+		select {
+		case <-ctx.Done():
+			return
+		case jobs <- Job{ID: id}:
+		}
+	}
+}
+
+func runWorker(
+	workCtx, stopCtx context.Context,
+	workerID int,
+	jobs <-chan Job,
+	results chan<- Result,
+	semaphore chan struct{},
+	statistics *Stats,
+) {
+	for {
+		var job Job
+		select {
+		case <-stopCtx.Done():
+			return
+		case next, ok := <-jobs:
+			if !ok {
+				return
+			}
+			job = next
+		}
+
+		select {
+		case <-stopCtx.Done():
+			return
+		case semaphore <- struct{}{}:
+		}
+
+		if stopCtx.Err() != nil {
+			<-semaphore
+			return
+		}
+
+		res := processJob(workCtx, job)
+		<-semaphore
+		statistics.record(workerID, res)
+
+		select {
+		case <-workCtx.Done():
+			return
+		case results <- res:
+		}
+	}
 }
 
 func processJob(ctx context.Context, job Job) (res Result) {
@@ -158,27 +203,26 @@ func callExternalService(ctx context.Context, j Job) (int, error) {
 	}
 }
 
-type Stats struct {
-	mu       sync.Mutex
-	panics   int
-	failed   int
-	byWorker map[int]int
-}
+func waitForShutdown(
+	workCtx, stopCtx context.Context,
+	workersDone <-chan struct{},
+	timeout time.Duration,
+	cancelWork context.CancelFunc,
+) {
+	select {
+	case <-workersDone:
+		return
+	case <-workCtx.Done():
+		return
+	case <-stopCtx.Done():
+	}
 
-func (s *Stats) recordSuccess(workerID int) {
-	s.mu.Lock()
-	s.byWorker[workerID]++
-	s.mu.Unlock()
-}
-
-func (s *Stats) recordPanics() {
-	s.mu.Lock()
-	s.panics++
-	s.mu.Unlock()
-}
-
-func (s *Stats) recordFailed() {
-	s.mu.Lock()
-	s.failed++
-	s.mu.Unlock()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-workersDone:
+	case <-workCtx.Done():
+	case <-timer.C:
+		cancelWork()
+	}
 }
