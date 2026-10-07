@@ -49,7 +49,9 @@ func main() {
 	results := make(chan Result)
 	semaphore := make(chan struct{}, K)
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
 	wg := &sync.WaitGroup{}
 
 	statistics := Stats{
@@ -57,12 +59,14 @@ func main() {
 	}
 
 	go func() {
+		defer close(jobs)
 		for i := 1; i <= N; i++ {
-			jobs <- Job{
-				ID: i,
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- Job{ID: i}:
 			}
 		}
-		close(jobs)
 	}()
 
 	for workerID := range M {
@@ -70,23 +74,43 @@ func main() {
 		go func() {
 			defer wg.Done()
 
-			for job := range jobs {
-				semaphore <- struct{}{}
-				subCtx, cancel := context.WithTimeout(ctx, timeout)
+			for {
+				select {
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
+					select {
+					case <-ctx.Done():
+						return
+					case semaphore <- struct{}{}:
+					}
 
-				res := processJob(subCtx, job)
-				cancel()
-				<-semaphore
+					if ctx.Err() != nil {
+						<-semaphore
+						return
+					}
 
-				if res.panicked {
-					statistics.recordPanics()
-				} else if res.error != nil {
-					statistics.recordFailed()
-				} else {
-					statistics.recordSuccess(workerID)
+					res := processJob(ctx, job)
+					<-semaphore
+
+					if res.panicked {
+						statistics.recordPanics()
+					} else if res.error != nil {
+						statistics.recordFailed()
+					} else {
+						statistics.recordSuccess(workerID)
+					}
+
+					select {
+					case <-ctx.Done():
+						return
+					case results <- res:
+					}
+
+				case <-ctx.Done():
+					return
 				}
-
-				results <- res
 			}
 		}()
 	}
