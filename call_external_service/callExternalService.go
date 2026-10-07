@@ -41,11 +41,13 @@ type Result struct {
 
 func main() {
 	N := 10
-	M := 5
+	M := 4
+	K := 2
 	timeout := time.Second * 3
 
 	jobs := make(chan Job)
 	results := make(chan Result)
+	semaphore := make(chan struct{}, K)
 
 	ctx := context.Background()
 	wg := &sync.WaitGroup{}
@@ -69,10 +71,13 @@ func main() {
 			defer wg.Done()
 
 			for job := range jobs {
+				semaphore <- struct{}{}
 				subCtx, cancel := context.WithTimeout(ctx, timeout)
 
 				res := processJob(subCtx, job)
 				cancel()
+				<-semaphore
+
 				if res.panicked {
 					statistics.recordPanics()
 				} else if res.error != nil {
